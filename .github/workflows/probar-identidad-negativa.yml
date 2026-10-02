@@ -1,0 +1,181 @@
+# =============================================================================
+# probar-identidad-negativa.yml — Prueba negativa de la identidad de producción (GCP)
+# Versión: 1.0 | Fecha: 2026-10-02
+# -----------------------------------------------------------------------------
+# Comprueba que un job SIN Environment NO puede obtener la identidad de
+# producción: intenta federarse con el provider de producción y solo da VERDE si
+# lo rechaza donde corresponde (01-seguridad/02 §1.2 y §5.1).
+#
+#   VERDE  STS responde 400 «attribute condition»: la condición del provider
+#          (capa 2) rechazó el token. Es el resultado normal.
+#   VERDE  (solo con CAPA_ESPERADA: 'cualquiera') STS aceptó y IAM respondió 403
+#          getAccessToken: el binding de la cuenta (capa 1) rechazó el token.
+#   ROJO   la cuenta de producción es alcanzable sin aprobación (IAM 200).
+#   ROJO   deriva: con CAPA_ESPERADA: 'cualquiera', el rechazo ocurrió en la capa 1; la
+#          condición del provider aceptó un token sin Environment.
+#   ROJO   inconcluso: cualquier otra respuesta, o un ancla sin fijar. Un rechazo
+#          que no es el esperado no prueba nada sobre producción.
+#
+# Usa curl y no google-github-actions/auth: esa acción falla ante cualquier
+# rechazo sin dejar distinguir la capa, y aquí hace falta leer la respuesta de
+# STS y de IAM. Tampoco usa continue-on-error: convertiría en verde tanto una
+# exposición real como un resultado inconcluso.
+#
+# Se copia A MANO al repositorio (no lo siembra bootstrap-repo.sh, que no tiene
+# los literales del proyecto ni el secreto). Los valores REEMPLAZAR dan ROJO
+# inconcluso hasta que el proyecto fija los suyos. Se lanza sobre main; en Modo B0
+# nunca sobre un tag (da ROJO por diseño). En A/B, un dispatch sobre un tag v*
+# estable ejercita además la cláusula del Environment (VERDE, capa 2). Detalle
+# completo en 01-seguridad/02 §5.1.
+# =============================================================================
+name: probar-identidad-negativa
+
+on:
+  workflow_dispatch: {}
+  # Semanal, sobre main (ref=refs/heads/main): detecta que la condición deje de
+  # rechazar un token de una rama (p. ej. perder la cláusula del tag o volver a solo
+  # owner). No ejercita las cláusulas de owner, de estabilidad del tag ni del
+  # Environment, ni detecta un binding relajado en modo '2' (§5.1, «Límite»).
+  schedule:
+    - cron: '23 7 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: probar-identidad-negativa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gcp-produccion-sin-aprobacion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # SIN `environment:` a propósito: la prueba es que un job sin aprobación no
+    # llega a producción. Con Environment recibiría el claim `environment` y la
+    # prueba dejaría de ser negativa (el paso lo comprueba y falla si aparece).
+    permissions:
+      id-token: write
+    env:
+      # ID del proyecto GCP de producción (el de deploy-production@).
+      PROYECTO_PROD_ESPERADO: 'sg-wif-prueba-20261002'
+      # Ancla del provider: 16 primeros hexadecimales del SHA-256 de la ruta del
+      # provider, sin salto de línea final (receta en 01-seguridad/02 §5.1):
+      #   printf '%s' "<ruta del provider>" | sha256sum | cut -c1-16
+      # Ancla, no oculta: el número de proyecto se obtiene por fuerza bruta.
+      HUELLA_PROVIDER_PROD: '22a70c57a07adf0c'
+      # '2': el rechazo debe ocurrir en la condición del provider (capa 2); en la
+      # capa 1 es ROJO por deriva. 'cualquiera' acepta también la capa 1 (úsese
+      # solo mientras la condición se está migrando).
+      CAPA_ESPERADA: 'cualquiera'
+    steps:
+      - name: Intentar la identidad de producción sin Environment
+        env:
+          # Secreto de REPOSITORIO: este job no tiene Environment y no ve el de `production`.
+          WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER_PROD }}
+        run: |
+          set -euo pipefail
+          resumen() { printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; }
+          inconcluso() { resumen "**ROJO: inconcluso.** $1"; echo "::error::Resultado inconcluso: $1"; exit 1; }
+
+          # Anclas: sin ellas un rechazo de otro provider o proyecto daría verde en falso.
+          [ -n "${WIF_PROVIDER:-}" ] || inconcluso "falta el secreto de repositorio GCP_WIF_PROVIDER_PROD."
+          # Forma exacta de la ruta, antes de enmascararla o de usarla en una URL: una línea extra, un
+          # espacio o un `?x=1&audience=...` no deben llegar a ::add-mask:: ni a la audiencia. Sin imprimir el valor.
+          [[ "$WIF_PROVIDER" =~ ^projects/[0-9]{1,20}/locations/global/workloadIdentityPools/[a-z0-9-]{4,32}/providers/[a-z0-9-]{4,32}$ ]] || inconcluso "GCP_WIF_PROVIDER_PROD no tiene la forma de la ruta de un provider."
+          [[ "$PROYECTO_PROD_ESPERADO" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || inconcluso "PROYECTO_PROD_ESPERADO no es un ID de proyecto (¿sigue en REEMPLAZAR?)."
+          [[ "$HUELLA_PROVIDER_PROD" =~ ^[0-9a-f]{16}$ ]] || inconcluso "HUELLA_PROVIDER_PROD no son 16 hexadecimales (¿sigue en REEMPLAZAR?)."
+          case "$CAPA_ESPERADA" in 2|cualquiera) ;; *) inconcluso "CAPA_ESPERADA debe ser '2' o 'cualquiera'." ;; esac
+          echo "::add-mask::$WIF_PROVIDER"
+          numero="${WIF_PROVIDER#projects/}"; numero="${numero%%/*}"; [ -z "$numero" ] || echo "::add-mask::$numero"
+          huella="$(printf '%s' "$WIF_PROVIDER" | sha256sum | cut -c1-16)"
+          [ "$huella" = "$HUELLA_PROVIDER_PROD" ] || inconcluso "GCP_WIF_PROVIDER_PROD no es el provider anclado (huella ${huella}): un rechazo de otro provider no prueba nada sobre producción."
+          resumen "## Prueba negativa de la identidad de producción (GCP)"
+
+          # Token OIDC de GitHub para ese provider. Nunca en argv, en disco ni en outputs.
+          audiencia_url="$(jq -rn --arg a "https://iam.googleapis.com/${WIF_PROVIDER}" '$a|@uri')"
+          oidc="$(printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | curl -sS --fail --connect-timeout 10 --max-time 30 -H @- "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audiencia_url}" | jq -r '.value // empty')" || inconcluso "no se obtuvo el token OIDC de GitHub."
+          [ -n "$oidc" ] || inconcluso "no se obtuvo el token OIDC de GitHub."
+          echo "::add-mask::$oidc"
+
+          # La prueba solo vale si el job NO trae el claim environment.
+          seg="$(printf '%s' "$oidc" | cut -d. -f2 | tr '_-' '/+')"; while [ $(( ${#seg} % 4 )) -ne 0 ]; do seg="${seg}="; done
+          claims="$(printf '%s' "$seg" | base64 -d 2>/dev/null)" || inconcluso "no se pudieron leer los claims del token."
+          entorno="$(printf '%s' "$claims" | jq -r '.environment // empty')"
+          [ -z "$entorno" ] || inconcluso "el job trae el claim environment=${entorno}: la prueba dejaría de ser negativa."
+          resumen "- sub: \`$(printf '%s' "$claims" | jq -r '.sub // "(ausente)"')\` · ref: \`$(printf '%s' "$claims" | jq -r '.ref // "(ausente)"')\`"
+          unset claims seg
+
+          # Capa 2: intercambio en STS. El token va por stdin, no en argv.
+          respuesta="$(printf '%s' "$oidc" | curl -sS --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -X POST https://sts.googleapis.com/v1/token \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            --data-urlencode "audience=//iam.googleapis.com/${WIF_PROVIDER}" \
+            --data-urlencode "scope=https://www.googleapis.com/auth/cloud-platform" \
+            --data-urlencode "requested_token_type=urn:ietf:params:oauth:token-type:access_token" \
+            --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+            --data-urlencode "subject_token@-")" || inconcluso "no se pudo consultar STS."
+          unset oidc
+          codigo="${respuesta##*$'\n'}"; cuerpo="${respuesta%$'\n'*}"; unset respuesta
+
+          if [ "$codigo" != "200" ]; then
+            # Verde solo ante el rechazo exacto de la condición. Si `error` es un objeto
+            # se toma solo `status`. Nunca se imprime error_description ni message.
+            error="$(printf '%s' "$cuerpo" | jq -r 'if (.error | type) == "object" then (.error.status // "") else (.error // "") end' 2>/dev/null)" || error=""
+            condicion="$(printf '%s' "$cuerpo" | jq -r '(.error_description // "") | ascii_downcase | contains("attribute condition")' 2>/dev/null)" || condicion=""
+            unset cuerpo
+            if [ "$codigo" = "400" ] && [ "$error" = "unauthorized_client" ] && [ "$condicion" = "true" ]; then
+              resumen "**VERDE: rechazado por la condición del provider (capa 2).**"
+              echo "VERDE: rechazado por la condición del provider (capa 2)."
+              exit 0
+            fi
+            [[ "$error" =~ ^[A-Za-z_]{1,40}$ ]] || error="(no reconocido)"
+            inconcluso "STS respondió HTTP ${codigo} (error: ${error}) y no es el rechazo de la condición del provider."
+          fi
+          token="$(printf '%s' "$cuerpo" | jq -r '.access_token // empty' 2>/dev/null)" || token=""
+          unset cuerpo
+          [ -n "$token" ] || inconcluso "STS respondió 200 sin access_token."
+          echo "::add-mask::$token"
+
+          # Capa 1: la cuenta de producción. Solo se llega aquí si la condición aceptó el token.
+          respuesta="$(printf 'Authorization: Bearer %s\n' "$token" | curl -sS --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -X POST -H @- \
+            -H 'Content-Type: application/json' \
+            -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"],"lifetime":"300s"}' \
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/deploy-production@${PROYECTO_PROD_ESPERADO}.iam.gserviceaccount.com:generateAccessToken")" || inconcluso "no se pudo consultar IAM Credentials."
+          unset token
+          codigo="${respuesta##*$'\n'}"; cuerpo="${respuesta%$'\n'*}"; unset respuesta
+
+          if [ "$codigo" = "200" ]; then
+            unset cuerpo
+            resumen "**ROJO: la cuenta de producción es alcanzable sin aprobación.**"
+            echo "::error::La cuenta de producción es alcanzable sin aprobación."
+            exit 1
+          fi
+
+          # Un 403 es la capa 1 solo si es PERMISSION_DENIED sobre getAccessToken: otro 403
+          # (API desactivada, otro permiso) no prueba nada sobre el binding. IAM responde igual
+          # ante un binding denegado que ante una cuenta inexistente o de otro proyecto («denied
+          # on resource (or it may not exist)»; comportamiento no medido (verificar)): por eso
+          # el VERDE de la capa 1 depende de que PROYECTO_PROD_ESPERADO sea correcto.
+          capa1=0
+          if [ "$codigo" = "403" ]; then
+            estado="$(printf '%s' "$cuerpo" | jq -r '.error.status // ""' 2>/dev/null)" || estado=""
+            razon="$(printf '%s' "$cuerpo" | jq -r '[.error.details[]? | select((."@type" // "") | endswith("google.rpc.ErrorInfo")) | .reason][0] // ""' 2>/dev/null)" || razon=""
+            permiso="$(printf '%s' "$cuerpo" | jq -r '[.error.details[]? | select((."@type" // "") | endswith("google.rpc.ErrorInfo")) | .metadata.permission][0] // ""' 2>/dev/null)" || permiso=""
+            menciona="$(printf '%s' "$cuerpo" | jq -r '(.error.message // "") | contains("iam.serviceAccounts.getAccessToken")' 2>/dev/null)" || menciona=""
+            if [ "$estado" = "PERMISSION_DENIED" ]; then
+              if [ "$razon" = "IAM_PERMISSION_DENIED" ] && [ "$permiso" = "iam.serviceAccounts.getAccessToken" ]; then capa1=1; fi
+              if [ -z "$razon" ] && [ "$menciona" = "true" ]; then capa1=1; fi
+            fi
+          fi
+          unset cuerpo
+
+          if [ "$capa1" = "1" ]; then
+            if [ "$CAPA_ESPERADA" = "2" ]; then
+              resumen "**ROJO: deriva.** la condición del provider aceptó un token sin Environment (capa 2 relajada); solo lo detuvo el binding (capa 1)."
+              echo "::error::Deriva: la condición del provider aceptó un token sin Environment (capa 2 relajada); solo lo detuvo el binding (capa 1)."
+              exit 1
+            fi
+            resumen "**VERDE: rechazado por el binding de la cuenta (capa 1).**"
+            echo "VERDE: rechazado por el binding de la cuenta (capa 1)."
+            exit 0
+          fi
+          inconcluso "IAM Credentials respondió HTTP ${codigo} y no es el rechazo de getAccessToken por el binding."
