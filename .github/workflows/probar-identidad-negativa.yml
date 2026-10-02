@@ -8,10 +8,10 @@
 #
 #   VERDE  STS responde 400 «attribute condition»: la condición del provider
 #          (capa 2) rechazó el token. Es el resultado normal.
-#   VERDE  (solo con CAPA_ESPERADA: 'cualquiera') STS aceptó y IAM respondió 403
+#   VERDE  (solo con CAPA_ESPERADA: '2') STS aceptó y IAM respondió 403
 #          getAccessToken: el binding de la cuenta (capa 1) rechazó el token.
 #   ROJO   la cuenta de producción es alcanzable sin aprobación (IAM 200).
-#   ROJO   deriva: con CAPA_ESPERADA: 'cualquiera', el rechazo ocurrió en la capa 1; la
+#   ROJO   deriva: con CAPA_ESPERADA: '2', el rechazo ocurrió en la capa 1; la
 #          condición del provider aceptó un token sin Environment.
 #   ROJO   inconcluso: cualquier otra respuesta, o un ancla sin fijar. Un rechazo
 #          que no es el esperado no prueba nada sobre producción.
@@ -66,7 +66,7 @@ jobs:
       # '2': el rechazo debe ocurrir en la condición del provider (capa 2); en la
       # capa 1 es ROJO por deriva. 'cualquiera' acepta también la capa 1 (úsese
       # solo mientras la condición se está migrando).
-      CAPA_ESPERADA: 'cualquiera'
+      CAPA_ESPERADA: '2'
     steps:
       - name: Intentar la identidad de producción sin Environment
         env:
